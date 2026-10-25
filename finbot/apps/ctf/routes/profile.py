@@ -1,5 +1,6 @@
 """Profile API Routes - Social features for authenticated users"""
 
+import asyncio
 import hashlib
 import ipaddress
 import logging
@@ -25,47 +26,70 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/profile", tags=["profile"])
 
 BLOCKED_NETWORKS = [
+    ipaddress.ip_network("0.0.0.0/8"),      # "this" network
     ipaddress.ip_network("127.0.0.0/8"),    # loopback
     ipaddress.ip_network("169.254.0.0/16"), # link-local (AWS metadata)
     ipaddress.ip_network("10.0.0.0/8"),     # RFC-1918 private
     ipaddress.ip_network("172.16.0.0/12"),  # RFC-1918 private
     ipaddress.ip_network("192.168.0.0/16"), # RFC-1918 private
+    ipaddress.ip_network("100.64.0.0/10"),  # carrier-grade NAT
+    ipaddress.ip_network("::/128"),         # IPv6 unspecified
     ipaddress.ip_network("::1/128"),        # IPv6 loopback
     ipaddress.ip_network("fc00::/7"),       # IPv6 ULA
     ipaddress.ip_network("fe80::/10"),      # IPv6 link-local
 ]
 
+
+def _is_blocked_ip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """True if the address is not a public unicast address."""
+    # ::ffff:127.0.0.1 and friends must be judged as the IPv4 address they carry
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    if (
+        ip.is_private
+        or ip.is_loopback
+        or ip.is_link_local
+        or ip.is_multicast
+        or ip.is_reserved
+        or ip.is_unspecified
+    ):
+        return True
+    return any(ip in net for net in BLOCKED_NETWORKS)
+
+
 def get_safe_ssrf_ip(url: str) -> str | None:
-    """Resolve a URL to a safe IP address, preventing SSRF."""
-    parsed = urlparse(url)
-    if parsed.scheme != "https":
-        return None
+    """Resolve a URL to a safe IP address, preventing SSRF.
+
+    Returns None (fail closed) if the URL is not plain https, is malformed,
+    or if ANY address the hostname resolves to is non-public.
+    """
     try:
-        host = parsed.hostname
-        if not host:
+        parsed = urlparse(url)
+        if parsed.scheme != "https":
             return None
-            
+        host = parsed.hostname
+        if not host or parsed.username or parsed.password:
+            return None
+        port = parsed.port or 443  # raises ValueError on a bad port
+
         # Use getaddrinfo to get all IPv4 and IPv6 addresses
-        addr_info = socket.getaddrinfo(host, 443, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        
-        # Extract unique IP address strings
-        ips = {info[4][0] for info in addr_info}
-        
-        safe_ip = None
-        for ip_str in ips:
-            ip_obj = ipaddress.ip_address(ip_str)
-            # If ANY resolved IP is in a blocked network, abort completely
-            if any(ip_obj in net for net in BLOCKED_NETWORKS):
-                return None
-            safe_ip = ip_str
-            
-        return safe_ip
+        addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
+        ips = [info[4][0] for info in addr_info]
+        if not ips:
+            return None
+
+        # If ANY resolved IP is in a blocked network, abort completely
+        if any(_is_blocked_ip(ipaddress.ip_address(ip_str)) for ip_str in ips):
+            return None
+
+        return ips[0]
     except Exception:
         return None  # fail closed
 
-def is_ssrf_safe(url: str) -> bool:
-    """Wrapper that returns True if the URL resolves to a safe IP."""
-    return get_safe_ssrf_ip(url) is not None
+
+async def resolve_safe_ip(url: str) -> str | None:
+    """Async wrapper so DNS resolution doesn't block the event loop."""
+    return await asyncio.to_thread(get_safe_ssrf_ip, url)
 
 
 # =============================================================================
@@ -394,7 +418,7 @@ async def update_profile(
     effective_avatar_type = request.avatar_type if request.avatar_type is not None else profile.avatar_type
     effective_avatar_url = request.avatar_url if request.avatar_url is not None else profile.avatar_url
     if effective_avatar_type == "url" and effective_avatar_url:
-        if not is_ssrf_safe(effective_avatar_url):
+        if await resolve_safe_ip(effective_avatar_url) is None:
             raise HTTPException(status_code=400, detail="Invalid Avatar URL: Only public HTTPS URLs are allowed")
 
     # Update other fields

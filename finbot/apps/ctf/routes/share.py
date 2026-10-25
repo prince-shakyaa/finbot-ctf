@@ -23,7 +23,7 @@ from finbot.core.data.repositories import (
     UserProfileRepository,
 )
 
-from .profile import calculate_level, resolve_avatar_url, xp_progress
+from .profile import calculate_level, resolve_avatar_url, resolve_safe_ip, xp_progress
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/share", tags=["share"])
@@ -90,27 +90,27 @@ def get_cache_path(cache_key: str) -> Path:
     return CACHE_DIR / f"{cache_key}.png"
 
 
-from urllib.parse import urlparse
-from finbot.apps.ctf.routes.profile import get_safe_ssrf_ip
-
 async def _fetch_avatar_b64(url: str) -> str:
     """Fetch a remote avatar image and return it as a base64 data URI.
 
     Returns empty string on any failure (timeout, bad content type, too large).
     """
-    safe_ip = get_safe_ssrf_ip(url)
+    safe_ip = await resolve_safe_ip(url)
     if not safe_ip:
         return ""
-        
-    parsed = urlparse(url)
-    new_url = f"https://{safe_ip}{parsed.path}"
-    if parsed.query:
-        new_url += f"?{parsed.query}"
 
     try:
-        # verify=False is required because the TLS certificate belongs to the hostname, not the IP
-        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False, verify=False) as client:
-            resp = await client.get(new_url, headers={"Host": parsed.hostname})
+        # Connect to the IP we just validated so a second DNS lookup can't be
+        # rebound to an internal address. The original hostname still goes in
+        # the Host header and in SNI, so TLS is verified against the real cert.
+        original = httpx.URL(url)
+        pinned_url = original.copy_with(host=safe_ip)
+        async with httpx.AsyncClient(timeout=5.0, follow_redirects=False) as client:
+            resp = await client.get(
+                pinned_url,
+                headers={"Host": original.netloc.decode("ascii")},
+                extensions={"sni_hostname": original.raw_host.decode("ascii")},
+            )
             if resp.status_code != 200:
                 return ""
             content_type = resp.headers.get("content-type", "")
